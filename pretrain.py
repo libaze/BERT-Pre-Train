@@ -12,25 +12,37 @@ def _read_txt(data_dir, file_name):
         lines = f.readlines()
     # 大写字母转换为小写字母
     # 保留至少有两句话的段落，作为文本对输入
-
     paragraphs = [line.strip().lower().split(' . ')
                   for line in lines if len(line.split(' . ')) >= 2]
-    # 打乱顺序，为后续预训练任务的随机性要求做准备
+    #打乱顺序，为后续预训练任务的随机性要求做准备
     random.shuffle(paragraphs)
     return paragraphs
 
 
-# paragraphs = _read_txt(data_dir, file_name)
-# print(paragraphs[0])
 
 
-# 辅助函数，生成训练样本句子对
+def get_tokens_and_segments(tokens_a, tokens_b=None):
+
+    #添加特殊分类标记与句子分隔符
+    tokens = ['<cls>'] + tokens_a + ['<sep>']
+    #进行段嵌入，区分句子对，+2是因为有cls与sep
+    segments = [0] * (len(tokens_a) + 2)
+    if tokens_b is not None:
+        #将句子两两配对拼在一起
+        tokens += tokens_b + ['<sep>']
+        #+1，只有sep
+        #对应地，segments拼接
+        segments += [1] * (len(tokens_b) + 1)
+    return tokens, segments
+
+
+#辅助函数，生成训练样本句子对
 def _get_next_sentence(sentence, next_sentence, paragraphs):
     if random.random() < 0.5:
         is_next = True
     else:
         # paragraphs是三重列表的嵌套
-        # random.choice 从序列中随机选一个元素，由于段落组列表三重嵌套。
+        #random.choice 从序列中随机选一个元素，由于段落组列表三重嵌套。
         # 所以，第一次选一个段落，第二次从选中段落中选择一个句子。
         # 也即一半时间，下一句预测为假，为随机抽取的句子
         next_sentence = random.choice(random.choice(paragraphs))
@@ -43,30 +55,26 @@ def _get_nsp_data_from_paragraph(paragraph, paragraphs, vocab, max_len):
     for i in range(len(paragraph) - 1):
         tokens_a, tokens_b, is_next = _get_next_sentence(
             paragraph[i], paragraph[i + 1], paragraphs)
-        # 考虑1个'<cls>'词元和2个'<sep>'词元
-        # 如果句子和下一句的总长度高于BERT的最大输入，则不能用作BERT的预训练，舍去
+        # 考虑1个'<cls>'词元和2个'<sep>'词元，如果句子和下一句的总长度高于BERT的最大输入，则不能用作BERT的预训练，舍去
         if len(tokens_a) + len(tokens_b) + 3 > max_len:
             continue
-            # 加上分段标记和分类头以及sep等，同时用0,1分段
-            # 循环过程中，每个句子对都进行分段和分类操作，最终nsp_data_from_paragraph是所有下一句预测句子对与正确/错误标记的列表
-        tokens, segments = bert.get_tokens_and_segments(tokens_a, tokens_b)
+            #加上分段标记和分类头以及sep等，同时用0,1分段
+            #循环过程中，每个句子对都进行分段和分类操作，最终nsp_data_from_paragraph是所有下一句预测句子对与正确/错误标记的列表
+        tokens, segments = get_tokens_and_segments(tokens_a, tokens_b)
         nsp_data_from_paragraph.append((tokens, segments, is_next))
     return nsp_data_from_paragraph
 
 
-# tokens是表示BERT输入序列的词元的列表
-# candidate_pred_positions是不包括特殊词元的BERT输入序列的词元索引的列表
-# 及num_mlm_preds指示预测的数量
-# 替换过程
+#tokens是表示BERT输入序列的词元的列表
+#candidate_pred_positions是不包括特殊词元的BERT输入序列的词元索引的列表，及num_mlm_preds指示预测的数量
 def _replace_mlm_tokens(tokens, candidate_pred_positions, num_mlm_preds,
                         vocab):
-    # 为遮蔽语言模型的输入创建新的词元副本，其中输入可能包含替换的“<mask>”或随机词元
+    # 为遮蔽语言模型的输入创建新的词元副本，其中输入包含替换的“<mask>”或随机词元
     mlm_input_tokens = [token for token in tokens]
     pred_positions_and_labels = []
     # 打乱后用于在遮蔽语言模型任务中获取15%的随机词元进行预测
     random.shuffle(candidate_pred_positions)
     for mlm_pred_position in candidate_pred_positions:
-        # 凑足预测词元数量则停止
         if len(pred_positions_and_labels) >= num_mlm_preds:
             break
         masked_token = None
@@ -88,15 +96,12 @@ def _replace_mlm_tokens(tokens, candidate_pred_positions, num_mlm_preds,
 
 def _get_mlm_data_from_tokens(tokens, vocab):
     candidate_pred_positions = []
-    # tokens是一个字符串列表
     for i, token in enumerate(tokens):
-        # 在遮蔽语言模型任务中不会预测特殊词元
+        # 在遮蔽语言模型任务中不预测特殊词元
         if token in ['<cls>', '<sep>']:
             continue
-        # 普通词元的索引加入索引列表
         candidate_pred_positions.append(i)
-    # 遮蔽语言模型任务中预测15%的随机词元
-    # round(len(tokens) * 0.15) 将计算出的15%的长度四舍五入到最接近的整数。
+    #round(len(tokens) * 0.15) 计算出15%的长度。
     num_mlm_preds = max(1, round(len(tokens) * 0.15))
     mlm_input_tokens, pred_positions_and_labels = _replace_mlm_tokens(
         tokens, candidate_pred_positions, num_mlm_preds, vocab)
@@ -109,26 +114,26 @@ def _get_mlm_data_from_tokens(tokens, vocab):
 
 def _pad_bert_inputs(examples, max_len, vocab):
     max_num_mlm_preds = round(max_len * 0.15)
-    all_token_ids, all_segments, valid_lens, = [], [], []
+    all_token_ids, all_segments, valid_lens,  = [], [], []
     all_pred_positions, all_mlm_weights, all_mlm_labels = [], [], []
     nsp_labels = []
     for (token_ids, pred_positions, mlm_pred_label_ids, segments,
          is_next) in examples:
         all_token_ids.append(torch.tensor(token_ids + [vocab['<pad>']] * (
-                max_len - len(token_ids)), dtype=torch.long))
+            max_len - len(token_ids)), dtype=torch.long))
         all_segments.append(torch.tensor(segments + [0] * (
-                max_len - len(segments)), dtype=torch.long))
+            max_len - len(segments)), dtype=torch.long))
         # valid_lens不包括'<pad>'的计数
         valid_lens.append(torch.tensor(len(token_ids), dtype=torch.float32))
         all_pred_positions.append(torch.tensor(pred_positions + [0] * (
-                max_num_mlm_preds - len(pred_positions)), dtype=torch.long))
+            max_num_mlm_preds - len(pred_positions)), dtype=torch.long))
         # 填充词元的预测将通过乘以0权重在损失中过滤掉
         all_mlm_weights.append(
             torch.tensor([1.0] * len(mlm_pred_label_ids) + [0.0] * (
-                    max_num_mlm_preds - len(pred_positions)),
-                         dtype=torch.float32))
+                max_num_mlm_preds - len(pred_positions)),
+                dtype=torch.float32))
         all_mlm_labels.append(torch.tensor(mlm_pred_label_ids + [0] * (
-                max_num_mlm_preds - len(mlm_pred_label_ids)), dtype=torch.long))
+            max_num_mlm_preds - len(mlm_pred_label_ids)), dtype=torch.long))
         nsp_labels.append(torch.tensor(is_next, dtype=torch.long))
     return (all_token_ids, all_segments, valid_lens, all_pred_positions,
             all_mlm_weights, all_mlm_labels, nsp_labels)
@@ -152,8 +157,8 @@ class TextDataset(torch.utils.data.Dataset):
         # 获取遮蔽语言模型任务的数据
         # 对每个句子进行随机掩蔽
         examples = [(_get_mlm_data_from_tokens(tokens, self.vocab)
-                     + (segments, is_next))
-                    for tokens, segments, is_next in examples]
+                      + (segments, is_next))
+                     for tokens, segments, is_next in examples]
         # 填充输入
         (self.all_token_ids, self.all_segments, self.valid_lens,
          self.all_pred_positions, self.all_mlm_weights,
@@ -171,28 +176,29 @@ class TextDataset(torch.utils.data.Dataset):
 
 
 def load_data(batch_size, max_len):
-    """加载WikiText-2数据集"""
+    """加载Wiki数据集"""
     num_workers = bert.get_dataloader_workers()
-
-    data_dir = './'
+    data_dir = '.\\'
     file_name = 'wiki_test.txt'
     paragraphs = _read_txt(data_dir, file_name)
     train_set = TextDataset(paragraphs, max_len)
     train_iter = torch.utils.data.DataLoader(train_set, batch_size,
-                                             shuffle=True, num_workers=num_workers)
+                                        shuffle=True, num_workers=num_workers)
     return train_iter, train_set.vocab
 
 
-batch_size, max_len = 16, 256
+batch_size, max_len = 16, 64
 train_iter, vocab = load_data(batch_size, max_len)
 
 print('vocab shape is: ', len(vocab))
 
+
 net = bert.BERTModel(len(vocab), num_hiddens=128, norm_shape=[128],
-                         ffn_num_input=128, ffn_num_hiddens=256, num_heads=2,
-                         num_layers=2, dropout=0.2, key_size=128, query_size=128,
-                         value_size=128, hid_in_features=128, mlm_in_features=128,
-                         nsp_in_features=128)
+                    ffn_num_input=128, ffn_num_hiddens=256, num_heads=2,
+                    num_layers=2, dropout=0.2, key_size=128, query_size=128,
+                    value_size=128, hid_in_features=128, mlm_in_features=128,
+                    nsp_in_features=128)
+
 devices = bert.try_all_gpus()
 loss = nn.CrossEntropyLoss()
 
@@ -206,8 +212,8 @@ def _get_batch_loss_bert(net, loss, vocab_size, tokens_X,
                                   valid_lens_x.reshape(-1),
                                   pred_positions_X)
     # 计算遮蔽语言模型损失
-    mlm_l = loss(mlm_Y_hat.reshape(-1, vocab_size), mlm_Y.reshape(-1)) * \
-            mlm_weights_X.reshape(-1, 1)
+    mlm_l = loss(mlm_Y_hat.reshape(-1, vocab_size), mlm_Y.reshape(-1)) *\
+    mlm_weights_X.reshape(-1, 1)
     mlm_l = mlm_l.sum() / (mlm_weights_X.sum() + 1e-8)
     # 计算下一句子预测任务的损失
     nsp_l = loss(nsp_Y_hat, nsp_y)
@@ -220,13 +226,14 @@ def train_bert(train_iter, net, loss, vocab_size, devices, num_steps):
     trainer = torch.optim.Adam(net.parameters(), lr=0.01)
     step, timer = 0, bert.Timer()
     animator = bert.Animator(xlabel='step', ylabel='loss',
-                                 xlim=[1, num_steps], legend=['mlm', 'nsp'])
+                            xlim=[1, num_steps], legend=['mlm', 'nsp'])
+
     # 遮蔽语言模型损失的和，下一句预测任务损失的和，句子对的数量，计数
     metric = bert.Accumulator(4)
     num_steps_reached = False
     while step < num_steps and not num_steps_reached:
-        for tokens_X, segments_X, valid_lens_x, pred_positions_X, \
-                mlm_weights_X, mlm_Y, nsp_y in train_iter:
+        for tokens_X, segments_X, valid_lens_x, pred_positions_X,\
+            mlm_weights_X, mlm_Y, nsp_y in train_iter:
             tokens_X = tokens_X.to(devices[0])
             segments_X = segments_X.to(devices[0])
             valid_lens_x = valid_lens_x.to(devices[0])
@@ -255,30 +262,53 @@ def train_bert(train_iter, net, loss, vocab_size, devices, num_steps):
           f'{str(devices)}')
 
 
-# 获得bert编码
+#获得bert编码
 def get_bert_encoding(net, tokens_a, tokens_b=None):
-    tokens, segments = bert.get_tokens_and_segments(tokens_a, tokens_b)
+    tokens, segments = get_tokens_and_segments(tokens_a, tokens_b)
     token_ids = torch.tensor(vocab[tokens], device=devices[0]).unsqueeze(0)
     segments = torch.tensor(segments, device=devices[0]).unsqueeze(0)
     valid_len = torch.tensor(len(tokens), device=devices[0]).unsqueeze(0)
     encoded_X, _, _ = net(token_ids, segments, valid_len)
-    # 返回编码后的输入tokens
+    #返回编码后的输入tokens
     return encoded_X
 
 
 train_bert(train_iter, net, loss, len(vocab), devices, 50)
 plt.show()
 
-tokens_a = ['The', 'light', 'in', 'the', 'room', 'is', 'very', 'bright']
-tokens_b = ['She', 'felt', 'a', 'light', 'tap', 'on', 'her', 'shoulder']
-# encoded_text: (batch_size, seq_length, hidden_size)
-# <sep>'She', 'felt', 'a', 'light', 'tap', 'on', 'her', 'shoulder'<sep>
-encoded_text = get_bert_encoding(net, tokens_a, tokens_b)
-encoded_text_cls = encoded_text[:, 0, :]
-encoded_text_seg_a = encoded_text[:, 2, :]
-encoded_text_seg_b = encoded_text[:, 13, :]
 
-print(encoded_text_cls.shape)
+tokens_a_1 = ['The', 'bank', 'is', 'near', 'the', 'river']
+tokens_a_2 = ['She', 'goes', ' to', 'the', 'bank', 'to', 'deposit', 'money']
+tokens_b_1 = ['The', 'bat', 'flew', 'through', 'the', 'night']
+tokens_b_2 = ['He', 'used', 'the', 'bat', 'to', 'hit', 'the', 'ball']
+#encoded_text: (batch_size, seq_length, hidden_size)
+#<sep>'The', 'bank', 'is', 'near', 'the', 'river'<sep>
+tokens_a,_ = get_tokens_and_segments(tokens_a_1,tokens_a_2)
+tokens_b,_ = get_tokens_and_segments(tokens_b_1,tokens_b_2)
+print(tokens_a[2],' ', tokens_a[12])
 print('\n')
-print(encoded_text_seg_a[0][:3])
-print(encoded_text_seg_b[0][:3])
+print(tokens_b[2],' ', tokens_b[11])
+
+encoded_text_a = get_bert_encoding(net, tokens_a_1,tokens_a_2)
+encoded_text_b = get_bert_encoding(net, tokens_b_1,tokens_b_2)
+
+encoded_text_cls_a = encoded_text_a[:, 0, :]
+encoded_text_cls_b = encoded_text_b[:, 0, :]
+
+encoded_text_seg_a_1 = encoded_text_a[:, 2, :]
+encoded_text_seg_a_2 = encoded_text_a[:, 12, :]
+encoded_text_seg_b_1 = encoded_text_b[:, 2, :]
+encoded_text_seg_b_2 = encoded_text_b[:, 11, :]
+
+print(encoded_text_cls_a.shape)
+print(encoded_text_cls_b.shape)
+print('\n')
+print('sentence pair 1: ')
+print(encoded_text_seg_a_1[0][:3])
+print(encoded_text_seg_a_2[0][:3])
+print('\n')
+print('sentence pair 2: ')
+print(encoded_text_seg_b_1[0][:3])
+print(encoded_text_seg_b_2[0][:3])
+
+
